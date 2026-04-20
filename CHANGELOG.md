@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### 🚀 Added
+- Add `null` transformer to explicitly set field values to NULL (`\N` in PostgreSQL COPY format).
 - Add `default.preserve_null` option to keep NULL values (`\N`) as-is instead of transforming them.
 - Add wildcard patterns for table names and column rules. Use `name: "public.*"` to match all
   tables in a schema, `names: ["A.*", "B.*"]` to target multiple schemas, and `"*iban"` in column
