@@ -88,17 +88,12 @@ impl<W: 'static + Write + Send, I: 'static + Indicator + Send> PgDumper<W, I> {
 
         let matched_cfg = self.engine.settings.find_table(&table.get_names());
 
-        // Determine the transform_map key: for wildcard/names entries, use the
-        // full table name (registered by register_table_transforms); for exact
-        // entries, use the config name.
-        let transform_key = matched_cfg
-            .map(|c| {
-                if c.has_wildcards() || c.name.is_empty() {
-                    full_name.clone()
-                } else {
-                    c.name.clone()
-                }
-            })
+        // Use the engine's own key-derivation so register/lookup stay in sync
+        // even when both a specific entry and a wildcard entry contribute.
+        let transform_key = self
+            .engine
+            .settings
+            .transform_key(&full_name, &table.get_names())
             .unwrap_or_default();
 
         let has_transforms = self

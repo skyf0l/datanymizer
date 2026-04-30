@@ -114,7 +114,9 @@ impl Settings {
     }
 
     /// For a table that has been registered via [`register_table_transforms`], returns:
-    /// - the display label of the config rule that matched it (e.g. `public.*`)
+    /// - the display label of the config rule(s) that matched it. When both a
+    ///   specific and a wildcard entry contributed, the label is rendered as
+    ///   `"<specific> + <wildcard>"` so dry-run output makes the merge visible.
     /// - the list of anonymized column names
     ///
     /// Returns `None` if no config rule matches or no columns are anonymized.
@@ -123,28 +125,42 @@ impl Settings {
         full_name: &str,
         names: &[T],
     ) -> Option<(String, Vec<String>)> {
-        let table_cfg = self.find_table(names)?;
-        let transform_key = if table_cfg.has_wildcards() || table_cfg.name.is_empty() {
-            full_name.to_string()
-        } else {
-            table_cfg.name.clone()
-        };
+        let (specific, wildcard) = self.find_specific_and_wildcard(names);
+        let key = self.transform_key_for(full_name, specific, wildcard)?;
 
-        let transforms = self.transformers_for(&transform_key)?;
+        let transforms = self.transformers_for(&key)?;
         if transforms.is_empty() {
             return None;
         }
 
-        let rule_label = table_cfg
-            .patterns()
-            .into_iter()
-            .find(|pat| names.iter().any(|n| WildMatch::new(pat).matches(n.as_ref())))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| table_cfg.name.clone());
+        let specific_label = specific.and_then(|t| Self::matching_pattern_label(t, names));
+        let wildcard_label = wildcard.and_then(|t| Self::matching_pattern_label(t, names));
 
-        let columns = transforms.iter().map(|(col_name, _)| col_name.clone()).collect();
+        let rule_label = match (specific_label, wildcard_label) {
+            (Some(s), Some(w)) => format!("{s} + {w}"),
+            (Some(s), None) => s,
+            (None, Some(w)) => w,
+            (None, None) => String::new(),
+        };
+
+        let columns = transforms
+            .iter()
+            .map(|(col_name, _)| col_name.clone())
+            .collect();
 
         Some((rule_label, columns))
+    }
+
+    /// Returns the first pattern in `cfg` that matches any of `names`, used
+    /// purely for human-readable dry-run labelling.
+    fn matching_pattern_label<T: AsRef<str>>(cfg: &Table, names: &[T]) -> Option<String> {
+        cfg.patterns()
+            .into_iter()
+            .find(|pat| {
+                let matcher = WildMatch::new(pat);
+                names.iter().any(|n| matcher.matches(n.as_ref()))
+            })
+            .map(|s| s.to_string())
     }
 
     /// Returns global and table-local assertions in execution order.
@@ -164,45 +180,99 @@ impl Settings {
         asserts
     }
 
-    /// Finds a table config matching any of the given candidate names.
-    /// First tries exact match (preserving backward compatibility),
-    /// then tries wildcard patterns.
+    /// Returns the most specific matching table config for the given candidate
+    /// names. If both a specific (non-wildcard) entry and a wildcard entry
+    /// match, the specific entry is returned — but at dump time the merged rule
+    /// set actually applied is the union of both (see
+    /// [`register_table_transforms`]).
     pub fn find_table<T: AsRef<str>>(&self, names: &[T]) -> Option<&Table> {
-        self.find_table_match(names).map(|(table, _)| table)
+        let (specific, wildcard) = self.find_specific_and_wildcard(names);
+        specific.or(wildcard)
     }
 
-    /// Like `find_table`, but also returns whether the match was via a wildcard pattern.
-    fn find_table_match<T: AsRef<str>>(&self, names: &[T]) -> Option<(&Table, bool)> {
-        // Pass 1: exact match (existing behavior)
-        for name in names {
-            let table = self.get_table(name.as_ref());
-            if table.is_some() {
-                return table.map(|t| (t, false));
-            }
-        }
+    /// Splits matching table configs into a "specific" match (exact `name`
+    /// field, or non-wildcard pattern in `names` field) and a "wildcard" match
+    /// (any pattern containing `*` or `?`).
+    ///
+    /// Specific match: candidate names are tried in order, so a fully-qualified
+    /// name (e.g. `public.users`) beats a short name when both are listed —
+    /// preserving the prior `find_table` behavior for callers that rely on it.
+    /// Wildcard match: the first config-order entry wins, preserving prior
+    /// "first wildcard wins" semantics for overlapping wildcards.
+    ///
+    /// Replaces the previous "first-match-wins" logic across the whole table
+    /// list, which silently dropped rules from later entries when an earlier
+    /// wildcard claimed the table.
+    fn find_specific_and_wildcard<T: AsRef<str>>(
+        &self,
+        names: &[T],
+    ) -> (Option<&Table>, Option<&Table>) {
+        let is_wild = |s: &str| s.contains('*') || s.contains('?');
 
-        // Pass 2: pattern match — covers wildcard entries and `names` entries
-        // (even non-wildcard `names` entries, since pass 1 only checks `name` field)
-        for table_cfg in &self.tables {
-            if table_cfg.names.is_none() && !table_cfg.has_wildcards() {
-                continue;
-            }
-            let is_wild = |s: &str| s.contains('*') || s.contains('?');
-            for pattern in table_cfg.patterns() {
-                let matcher = WildMatch::new(pattern);
-                for name in names {
-                    if matcher.matches(name.as_ref()) {
-                        return Some((table_cfg, is_wild(pattern)));
+        // Specific match: name-order preferred (full_name beats short_name).
+        let mut specific: Option<&Table> = None;
+        'specific: for name in names {
+            for table_cfg in &self.tables {
+                for pattern in table_cfg.patterns() {
+                    if pattern.is_empty() || is_wild(pattern) {
+                        continue;
+                    }
+                    if pattern == name.as_ref() {
+                        specific = Some(table_cfg);
+                        break 'specific;
                     }
                 }
             }
         }
 
-        None
+        // Wildcard match: config-order preferred (first matching wildcard wins).
+        let mut wildcard: Option<&Table> = None;
+        'wildcard: for table_cfg in &self.tables {
+            for pattern in table_cfg.patterns() {
+                if pattern.is_empty() || !is_wild(pattern) {
+                    continue;
+                }
+                let matcher = WildMatch::new(pattern);
+                if names.iter().any(|n| matcher.matches(n.as_ref())) {
+                    wildcard = Some(table_cfg);
+                    break 'wildcard;
+                }
+            }
+        }
+
+        (specific, wildcard)
     }
 
-    /// Registers resolved transforms for a discovered table, resolving wildcard
-    /// table name patterns against actual table metadata.
+    /// The key under which merged transforms are registered in `transform_map`.
+    /// A specific entry with a non-wildcard `name` field uses that name (so
+    /// existing exact-name-based callers like `transformers_for("users")`
+    /// keep working); everything else uses the discovered `full_name`.
+    fn transform_key_for(
+        &self,
+        full_name: &str,
+        specific: Option<&Table>,
+        wildcard: Option<&Table>,
+    ) -> Option<String> {
+        if specific.is_none() && wildcard.is_none() {
+            return None;
+        }
+        Some(match specific {
+            Some(s) if !s.name.is_empty() && !s.has_wildcards() => s.name.clone(),
+            _ => full_name.to_string(),
+        })
+    }
+
+    /// Public entry point used by the dumper to compute the lookup key for a
+    /// given table without exposing the internal `Table` references.
+    pub fn transform_key<T: AsRef<str>>(&self, full_name: &str, names: &[T]) -> Option<String> {
+        let (specific, wildcard) = self.find_specific_and_wildcard(names);
+        self.transform_key_for(full_name, specific, wildcard)
+    }
+
+    /// Registers resolved transforms for a discovered table, merging rules
+    /// from any matching wildcard entry with rules from any matching specific
+    /// entry. Specific rules win on column collision; wildcard rules apply
+    /// only to columns that actually exist in the table (lenient mode).
     /// Called from the dumper after table/column metadata is known.
     pub fn register_table_transforms(
         &mut self,
@@ -210,48 +280,50 @@ impl Settings {
         short_name: &str,
         actual_columns: &[String],
     ) {
-        // Skip if already resolved by fill_transform_map (exact table)
-        if let Some(map) = &self.transform_map {
-            if map.contains_key(full_name) || map.contains_key(short_name) {
-                return;
-            }
-        }
-
         let names = [full_name, short_name];
-        let table_match = self.find_table_match(&names).map(|(t, w)| (t.clone(), w));
-
-        if let Some((cfg, matched_via_wildcard)) = table_match {
-            let transform_list = if matched_via_wildcard {
-                // Wildcard table: silently skip rules for columns that don't exist
-                let explicit_rule_order = cfg.rule_order.clone().unwrap_or_default();
-                let mut list: TransformList = cfg
-                    .rules
-                    .iter()
-                    .filter(|(col, _)| actual_columns.contains(col))
-                    .map(|(col, t)| (col.clone(), t.clone()))
-                    .collect();
-                list.sort_by_cached_key(|(key, _)| {
-                    explicit_rule_order.iter().position(|i| i == key)
-                });
-                list
-            } else {
-                // Exact table (via names field): use all rules as-is
-                cfg.transform_list()
-            };
-
-            if transform_list.is_empty() {
-                return;
-            }
-
-            let map = self.transform_map.get_or_insert_with(HashMap::new);
-            // Use the config name for exact entries, full_name for wildcard/names entries
-            let key = if cfg.name.is_empty() || matched_via_wildcard {
-                full_name.to_string()
-            } else {
-                cfg.name.clone()
-            };
-            map.insert(key, transform_list);
+        let (specific, wildcard) = self.find_specific_and_wildcard(&names);
+        if specific.is_none() && wildcard.is_none() {
+            return;
         }
+
+        // Layer 1: wildcard rules, filtered to columns that exist on this table
+        let mut merged: HashMap<String, Transformers> = HashMap::new();
+        if let Some(w) = wildcard {
+            for (col, t) in w.rules.iter() {
+                if actual_columns.iter().any(|c| c == col) {
+                    merged.insert(col.clone(), t.clone());
+                }
+            }
+        }
+
+        // Layer 2: specific rules — applied unconditionally (strict mode), and
+        // overwriting any wildcard rule for the same column
+        if let Some(s) = specific {
+            for (col, t) in s.rules.iter() {
+                merged.insert(col.clone(), t.clone());
+            }
+        }
+
+        if merged.is_empty() {
+            return;
+        }
+
+        // rule_order: specific takes precedence; fall back to wildcard
+        let explicit_rule_order = specific
+            .and_then(|s| s.rule_order.clone())
+            .or_else(|| wildcard.and_then(|w| w.rule_order.clone()))
+            .unwrap_or_default();
+
+        let mut transform_list: TransformList = merged.into_iter().map(|(k, v)| (k, v)).collect();
+        transform_list
+            .sort_by_cached_key(|(key, _)| explicit_rule_order.iter().position(|i| i == key));
+
+        let key = self
+            .transform_key_for(full_name, specific, wildcard)
+            .expect("checked above that at least one matched");
+
+        let map = self.transform_map.get_or_insert_with(HashMap::new);
+        map.insert(key, transform_list);
     }
 
     fn preprocess(&mut self) {
@@ -286,7 +358,6 @@ impl Settings {
         self.transform_map = Some(map);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -690,7 +761,7 @@ mod tests {
         }
 
         #[test]
-        fn exact_table_not_overwritten() {
+        fn exact_and_wildcard_rules_merged() {
             let config = r#"
                 tables:
                   - name: users
@@ -704,22 +775,123 @@ mod tests {
                 "#;
             let mut s = Settings::from_yaml(config).unwrap();
 
-            // Exact table already in transform_map from fill_transform_map
+            // Pre-registered by fill_transform_map: exact entry only
             let keys = transform_keys(&s, "users");
-            assert_eq!(keys.len(), 1);
-            assert!(keys.contains(&"name".to_string()));
+            assert_eq!(keys, vec!["name".to_string()]);
 
-            // register_table_transforms should not overwrite it
+            // After register_table_transforms with column metadata, the
+            // wildcard's `email` rule (column exists) is merged in alongside
+            // the specific entry's `name` rule.
             s.register_table_transforms(
                 "public.users",
                 "users",
                 &["name".to_string(), "email".to_string()],
             );
 
-            // Still the exact-match entry
             let keys = transform_keys(&s, "users");
-            assert_eq!(keys.len(), 1);
+            assert_eq!(keys.len(), 2);
             assert!(keys.contains(&"name".to_string()));
+            assert!(keys.contains(&"email".to_string()));
+        }
+
+        #[test]
+        fn specific_rules_override_wildcard_on_collision() {
+            let config = r#"
+                tables:
+                  - name: users
+                    rules:
+                      email:
+                        person_name: {}
+                  - name: "*"
+                    rules:
+                      email:
+                        first_name: {}
+                "#;
+            let mut s = Settings::from_yaml(config).unwrap();
+
+            s.register_table_transforms(
+                "public.users",
+                "users",
+                &["id".to_string(), "email".to_string()],
+            );
+
+            // The specific entry's `person_name` transformer should win
+            let transforms = s.transformers_for("users").unwrap();
+            assert_eq!(transforms.len(), 1);
+            let (col, t) = &transforms[0];
+            assert_eq!(col, "email");
+            // Verify it's the PersonName transformer (specific), not FirstName (wildcard)
+            assert!(matches!(t, Transformers::PersonName(_)));
+        }
+
+        #[test]
+        fn wildcard_rules_apply_to_specifically_matched_tables() {
+            // The original bug: specific entry below `*` was shadowed entirely;
+            // and even when reordered, the wildcard's column rules were lost
+            // for any table that hit a specific entry.
+            // After the fix, both contribute.
+            let config = r#"
+                tables:
+                  - name: "*"
+                    rules:
+                      notes:
+                        template:
+                          format: "[REDACTED]"
+                  - names: [videoconference]
+                    rules:
+                      name:
+                        first_name: {}
+                "#;
+            let mut s = Settings::from_yaml(config).unwrap();
+
+            s.register_table_transforms(
+                "public.videoconference",
+                "videoconference",
+                &["id".to_string(), "name".to_string(), "notes".to_string()],
+            );
+
+            let keys = transform_keys(&s, "public.videoconference");
+            assert_eq!(keys.len(), 2);
+            assert!(keys.contains(&"name".to_string()));
+            assert!(keys.contains(&"notes".to_string()));
+        }
+
+        #[test]
+        fn wildcard_columns_filtered_by_actual_columns_in_merge() {
+            // Wildcard rule for `phone` applies only when the specifically
+            // matched table actually has a `phone` column.
+            let config = r#"
+                tables:
+                  - name: "*"
+                    rules:
+                      phone:
+                        person_name: {}
+                  - names: [videoconference]
+                    rules:
+                      name:
+                        first_name: {}
+                "#;
+            let mut s = Settings::from_yaml(config).unwrap();
+
+            // No `phone` column → wildcard rule is dropped, only specific runs
+            s.register_table_transforms(
+                "public.videoconference",
+                "videoconference",
+                &["id".to_string(), "name".to_string()],
+            );
+            let keys = transform_keys(&s, "public.videoconference");
+            assert_eq!(keys, vec!["name".to_string()]);
+
+            // With a `phone` column → both wildcard and specific contribute
+            s.register_table_transforms(
+                "public.videoconference2",
+                "videoconference2",
+                &["name".to_string(), "phone".to_string()],
+            );
+            let keys = transform_keys(&s, "public.videoconference2");
+            // Note: "videoconference2" doesn't match the specific entry, so
+            // only the wildcard fires here.
+            assert_eq!(keys, vec!["phone".to_string()]);
         }
 
         #[test]
